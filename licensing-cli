@@ -1,0 +1,181 @@
+#!/usr/bin/env bun
+/**
+ * Licensing CLI helper — standalone Bun script wrapping Moonbase SDK.
+ *
+ * Usage:
+ *   bun build/licensing-cli.ts activate          → start browser-based activation
+ *   bun build/licensing-cli.ts poll <b64-request> → poll for activation completion
+ *   bun build/licensing-cli.ts validate           → validate stored license
+ *   bun build/licensing-cli.ts status             → current license info
+ *
+ * All output is JSON to stdout. Exit code 0 = success, 1 = error.
+ */
+
+import {
+  MoonbaseLicensing,
+  FileLicenseStore,
+  MoonbaseError,
+  type License,
+  type ActivationRequestResponse,
+} from "@moonbase.sh/licensing";
+import { homedir } from "os";
+import { join } from "path";
+import { mkdirSync } from "fs";
+
+// ─── Moonbase configuration ─────────────────────────────────────────────────
+const MOONBASE_ENDPOINT = "https://hexstack-app.moonbase.sh";
+const MOONBASE_PRODUCT_ID = "claude-grimoire";
+const MOONBASE_PUBLIC_KEY = `-----BEGIN RSA PUBLIC KEY-----
+MIIBCgKCAQEAloaC3R0rpB1ayMiWpLoI69032NMveVrdo/2NYOshrCP9jQJhRcrN
+RfPGdLhtJT7rzHAJsbfVHpe5Z2F3tOlFEr3g/lu5qshcu24T7vv1aT+AQOoZzi7r
+Yc9gFtOoyziv1CVbn7dnc63MSycw64Bm14fVDjdu0elJnlrFKjPiCfPWcKAC8h+v
+VTZfRi9KUbbihpNMHDtFQmQjKDlTB93yktlw1K4L5sI95ddN1pP0ZnQbDy1PUQzJ
+O02pH3LpezMg+C6E5VtUm+dYH7ZP7QdRhG0rQIYm0Xqvz/yUQYYdt9z8Vhh5EbiX
+5oOO7CcBUQ7E+pDH2YxdE+aN5VeOTuxorQIDAQAB
+-----END RSA PUBLIC KEY-----`;
+
+const LICENSE_DIR = join(homedir(), ".claude");
+const LICENSE_FILE = "cco-license.mb";
+
+// Ensure full directory structure exists (clean machines won't have ~/.claude/)
+mkdirSync(LICENSE_DIR, { recursive: true });
+for (const subdir of ["commands", "agents", "tasks", "cco-prompts"]) {
+  mkdirSync(join(LICENSE_DIR, subdir), { recursive: true });
+}
+
+// ─── Initialize SDK ──────────────────────────────────────────────────────────
+
+const store = new FileLicenseStore({
+  dir: LICENSE_DIR,
+  licenseFileName: LICENSE_FILE,
+});
+
+const licensing = new MoonbaseLicensing({
+  endpoint: MOONBASE_ENDPOINT,
+  productId: MOONBASE_PRODUCT_ID,
+  publicKey: MOONBASE_PUBLIC_KEY,
+  licenseStore: store,
+});
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+function ok(data: Record<string, any> = {}) {
+  console.log(JSON.stringify({ ok: true, ...data }));
+  process.exit(0);
+}
+
+function fail(error: string) {
+  console.log(JSON.stringify({ ok: false, error }));
+  process.exit(1);
+}
+
+function serializeLicense(license: License) {
+  return {
+    id: license.id,
+    trial: license.trial,
+    activationMethod: license.activationMethod,
+    product: license.product,
+    issuedAt: license.issuedAt?.toISOString?.() ?? license.issuedAt,
+    issuedTo: license.issuedTo,
+    expiresAt: license.expiresAt?.toISOString?.() ?? license.expiresAt ?? null,
+    validatedAt: license.validatedAt?.toISOString?.() ?? license.validatedAt,
+  };
+}
+
+// ─── Commands ────────────────────────────────────────────────────────────────
+
+async function activate() {
+  try {
+    const response = await licensing.client.requestActivation();
+    const requestData = Buffer.from(JSON.stringify(response)).toString(
+      "base64",
+    );
+    ok({
+      browser: response.browser,
+      requestData,
+    });
+  } catch (e: any) {
+    fail(
+      e instanceof MoonbaseError ? `${e.title}: ${e.detail ?? ""}` : e.message,
+    );
+  }
+}
+
+async function poll(requestDataB64: string) {
+  try {
+    const request: ActivationRequestResponse = JSON.parse(
+      Buffer.from(requestDataB64, "base64").toString("utf8"),
+    );
+    const license = await licensing.client.getRequestedActivation(request);
+    if (license) {
+      await store.storeLocalLicense(license);
+      ok({ activated: true, license: serializeLicense(license) });
+    } else {
+      ok({ activated: false });
+    }
+  } catch (e: any) {
+    fail(
+      e instanceof MoonbaseError ? `${e.title}: ${e.detail ?? ""}` : e.message,
+    );
+  }
+}
+
+async function validate() {
+  try {
+    const license = await store.loadLocalLicense();
+    if (!license) {
+      ok({ valid: false, reason: "no_license" });
+      return;
+    }
+    const updated = await licensing.client.validateLicense(license);
+    await store.storeLocalLicense(updated);
+    ok({ valid: true, license: serializeLicense(updated) });
+  } catch (e: any) {
+    if (e instanceof MoonbaseError) {
+      ok({
+        valid: false,
+        reason: e.type ?? "validation_failed",
+        detail: `${e.title}: ${e.detail ?? ""}`,
+      });
+    } else {
+      fail(e.message);
+    }
+  }
+}
+
+async function status() {
+  try {
+    const license = await store.loadLocalLicense();
+    if (!license) {
+      ok({ active: false });
+      return;
+    }
+    ok({ active: true, license: serializeLicense(license) });
+  } catch (e: any) {
+    fail(
+      e instanceof MoonbaseError ? `${e.title}: ${e.detail ?? ""}` : e.message,
+    );
+  }
+}
+
+// ─── CLI entry point ─────────────────────────────────────────────────────────
+
+const [cmd, arg] = process.argv.slice(2);
+
+switch (cmd) {
+  case "activate":
+    await activate();
+    break;
+  case "poll":
+    if (!arg) fail("poll requires requestData argument");
+    await poll(arg!);
+    break;
+  case "validate":
+    await validate();
+    break;
+  case "status":
+    await status();
+    break;
+  default:
+    fail(`Unknown command: ${cmd}. Use: activate, poll, validate, status`);
+}
