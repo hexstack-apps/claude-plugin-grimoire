@@ -7,5 +7,6 @@
     "email": "hexstack.app+support@gmail.com"
   },
   "homepage": "https://hexstack.app/claude-grimoire/",
-  "repository": "https://github.com/rchuvilev/claude-plugin-grimoire"
+  "repository": "https://github.com/rchuvilev/claude-plugin-grimoire",
+  "skills": "./skills/"
 }
