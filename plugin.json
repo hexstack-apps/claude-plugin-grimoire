@@ -1,6 +1,6 @@
 {
-  "name": "claude-grimoire",
-  "displayName": "Claude Grimoire",
+  "name": "grimoire",
+  "displayName": "Grimoire",
   "version": "1.0.7",
   "description": "Claude Code Configuration Manager - Manage commands, agents, pipelines, and prompts",
   "author": "HexStack",
