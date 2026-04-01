@@ -52,4 +52,4 @@ If you get "Bun is required but not installed":
 2. Restart your terminal/command prompt
 3. Verify with: `bun --version`
 
-Version: 1.0.0
+Version: 1.0.7

@@ -1,7 +1,7 @@
 {
   "name": "claude-grimoire",
   "displayName": "Claude Grimoire",
-  "version": "1.0.0",
+  "version": "1.0.7",
   "description": "Claude Code Configuration Manager - Manage commands, agents, pipelines, and prompts",
   "author": "HexStack",
   "repository": "https://github.com/hexstack/claude-grimoire",
@@ -32,7 +32,8 @@
     "claude-grimoire-mac",
     "claude-grimoire-win.exe",
     "claude-grimoire-linux",
-    "shared/",
+    "resources.neu",
+    "licensing-cli",
     "launch.sh",
     "launch.bat",
     "launch.ps1",
