@@ -1,0 +1,11 @@
+{
+  "name": "grimoire",
+  "description": "Claude Code Configuration Manager — visual GUI for commands, agents, MCP servers, hooks, and CLAUDE.md memory",
+  "version": "1.0.7",
+  "author": {
+    "name": "HexStack",
+    "email": "support@hexstack.app"
+  },
+  "homepage": "https://hexstack.app/claude-grimoire/",
+  "repository": "https://github.com/rchuvilev/claude-plugin-grimoire"
+}
