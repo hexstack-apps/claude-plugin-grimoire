@@ -8,5 +8,5 @@
   },
   "homepage": "https://hexstack.app/claude-grimoire/",
   "repository": "https://github.com/rchuvilev/claude-plugin-grimoire",
-  "skills": "./skills/"
+  "commands": "./commands/"
 }
