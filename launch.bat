@@ -33,9 +33,9 @@ if not exist "%SCRIPT_DIR%resources.neu" (
   copy "%SCRIPT_DIR%shared\resources.neu" "%SCRIPT_DIR%resources.neu"
 )
 
-REM Copy licensing CLI if needed
-if not exist "%SCRIPT_DIR%licensing-cli" (
-  copy "%SCRIPT_DIR%shared\licensing-cli" "%SCRIPT_DIR%licensing-cli"
+REM Copy grimoire CLI if needed
+if not exist "%SCRIPT_DIR%grimoire-cli" (
+  copy "%SCRIPT_DIR%shared\grimoire-cli" "%SCRIPT_DIR%grimoire-cli"
 )
 
 echo Starting Claude Grimoire on Windows...

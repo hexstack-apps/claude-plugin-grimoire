@@ -22,7 +22,7 @@ dist/plugin/
 ├── claude-grimoire-linux      # Linux binary
 ├── shared/
 │   ├── resources.neu          # Shared app resources
-│   └── licensing-cli          # Licensing component (TypeScript)
+│   └── grimoire-cli           # Backend CLI (TypeScript, includes licensing)
 ├── launch.sh                  # Unix launcher (macOS/Linux)
 ├── launch.bat                 # Windows batch launcher
 └── launch.ps1                 # Windows PowerShell launcher
@@ -52,4 +52,4 @@ If you get "Bun is required but not installed":
 2. Restart your terminal/command prompt
 3. Verify with: `bun --version`
 
-Version: 1.0.7
+Version: 1.0.8

@@ -47,9 +47,9 @@ if [ ! -f "$SCRIPT_DIR/resources.neu" ]; then
   cp "$SCRIPT_DIR/shared/resources.neu" "$SCRIPT_DIR/resources.neu"
 fi
 
-# Copy licensing CLI if needed
-if [ ! -f "$SCRIPT_DIR/licensing-cli" ]; then
-  cp "$SCRIPT_DIR/shared/licensing-cli" "$SCRIPT_DIR/licensing-cli"
+# Copy grimoire CLI if needed
+if [ ! -f "$SCRIPT_DIR/grimoire-cli" ]; then
+  cp "$SCRIPT_DIR/shared/grimoire-cli" "$SCRIPT_DIR/grimoire-cli"
 fi
 
 echo "Starting Claude Grimoire on $PLATFORM..."

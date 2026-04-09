@@ -32,9 +32,9 @@ if (-not (Test-Path "$scriptDir\resources.neu")) {
   Copy-Item "$scriptDir\shared\resources.neu" "$scriptDir\resources.neu"
 }
 
-# Copy licensing CLI if needed
-if (-not (Test-Path "$scriptDir\licensing-cli")) {
-  Copy-Item "$scriptDir\shared\licensing-cli" "$scriptDir\licensing-cli"
+# Copy grimoire CLI if needed
+if (-not (Test-Path "$scriptDir\grimoire-cli")) {
+  Copy-Item "$scriptDir\shared\grimoire-cli" "$scriptDir\grimoire-cli"
 }
 
 Write-Host "Starting Claude Grimoire on Windows..." -ForegroundColor Green
