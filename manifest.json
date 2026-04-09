@@ -1,0 +1,13 @@
+{
+  "manifestVersion": "1.0",
+  "id": "app.hexstack.claude-grimoire",
+  "name": "Claude Grimoire",
+  "version": "1.0.8",
+  "description": "Manage Claude Code configurations with a native GUI",
+  "author": {
+    "name": "HexStack",
+    "url": "https://hexstack.app"
+  },
+  "entryPoint": "launcher.js",
+  "runtime": "bun"
+}
