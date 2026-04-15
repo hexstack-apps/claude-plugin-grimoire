@@ -569,11 +569,16 @@ function skillsInstalled(): boolean {
   return OBSIDIAN_SKILL_DIRS.some(s => existsSync(join(skillsDir, s)));
 }
 
+function getObsidianBrainScriptPath(): string {
+  return join(getObsidianBrainDir(), "obsidian-brain.ts");
+}
+
 function hooksInstalled(): boolean {
   const hookDir = getObsidianHookDir();
   return existsSync(join(hookDir, "session-start.sh"))
       && existsSync(join(hookDir, "user-prompt.sh"))
-      && existsSync(join(hookDir, "stop.sh"));
+      && existsSync(join(hookDir, "stop.sh"))
+      && existsSync(getObsidianBrainScriptPath());
 }
 
 function cmdObsidianBrainStatus(): CommandResult {
@@ -589,155 +594,492 @@ function cmdObsidianBrainStatus(): CommandResult {
 }
 
 /**
- * Generates the three hook scripts. Each script no-ops when the enabled
- * flag is absent, so toggling off is instant (no re-wire needed).
+ * Ensure all brain directories exist. Idempotent and tolerant of missing parents.
  */
-function writeHookScripts() {
-  const hookDir = getObsidianHookDir();
+function ensureBrainDirs() {
   const dataDir = getObsidianVaultDataDir();
-  mkdirSync(hookDir, { recursive: true });
+  mkdirSync(getObsidianBrainDir(), { recursive: true });
+  mkdirSync(getObsidianHookDir(), { recursive: true });
   mkdirSync(dataDir, { recursive: true });
   mkdirSync(join(dataDir, "prompts"), { recursive: true });
   mkdirSync(join(dataDir, "sessions"), { recursive: true });
+  mkdirSync(getClaudeSkillsDir(), { recursive: true });
+}
 
+/**
+ * The main brain script — a single bun TS file that handles all hook modes
+ * AND runs as an MCP server. Written to disk on install.
+ *
+ * Modes:
+ *   session-start → output relevant prior prompts as additionalContext
+ *   user-prompt   → persist prompt page with keyword+cwd related links
+ *   stop          → parse transcript, append "## Outcome" section, mark completed
+ *   mcp           → run MCP server exposing brain_search, brain_recent, brain_read
+ */
+const OBSIDIAN_BRAIN_SCRIPT = String.raw`#!/usr/bin/env bun
+/* eslint-disable */
+import { readFileSync, writeFileSync, readdirSync, existsSync, statSync, mkdirSync, appendFileSync } from "fs";
+import { join } from "path";
+import { homedir } from "os";
+
+const BRAIN_DIR = join(homedir(), ".claude", "claude-grimoire", "obsidian-brain");
+const DATA_DIR  = join(homedir(), ".claude", "claude-grimoire", "brains", "semantic", "obsidian");
+const PROMPTS_DIR = join(DATA_DIR, "prompts");
+const INDEX_FILE  = join(DATA_DIR, "index.md");
+const ENABLED_FLAG = join(BRAIN_DIR, "enabled");
+
+const STOPWORDS = new Set([
+  "the","and","for","you","with","this","that","please","from","have","been","will","can","not",
+  "are","was","were","but","any","all","how","what","why","when","where","use","using","also",
+  "just","like","them","they","their","into","over","about","than","then","some","make","maybe",
+  "need","want","does","did","doing","get","got","run","ran","see","sees","saw","look","looking",
+  "now","next","new","old","add","added","remove","removed","fix","fixed","still","yet","its","it",
+]);
+
+function enabled() { return existsSync(ENABLED_FLAG); }
+function ensureDirs() {
+  mkdirSync(DATA_DIR, { recursive: true });
+  mkdirSync(PROMPTS_DIR, { recursive: true });
+}
+function iso() { return new Date().toISOString(); }
+function sha(s: string): string {
+  const h = new Bun.CryptoHasher("sha256");
+  h.update(s);
+  return h.digest("hex").slice(0, 12);
+}
+function slug(s: string): string {
+  return (s || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 80);
+}
+function keywords(text: string): string[] {
+  const hits = (text || "").toLowerCase().match(/[a-z][a-z0-9_-]{2,}/g) || [];
+  const out = new Set<string>();
+  for (const w of hits) if (!STOPWORDS.has(w)) out.add(w);
+  return [...out];
+}
+
+function readStdin(): string {
+  try { return readFileSync(0, "utf8"); } catch { return ""; }
+}
+
+function parseFrontmatter(content: string): { fm: Record<string, string>; body: string; raw: string } {
+  const m = content.match(/^---\n([\s\S]*?)\n---\n?/);
+  if (!m) return { fm: {}, body: content, raw: content };
+  const fm: Record<string, string> = {};
+  for (const line of m[1]!.split("\n")) {
+    const kv = line.match(/^(\w+):\s*"?(.*?)"?\s*$/);
+    if (kv) fm[kv[1]!] = kv[2] || "";
+  }
+  return { fm, body: content.slice(m[0].length), raw: content };
+}
+
+interface PromptEntry { file: string; path: string; fm: Record<string, string>; body: string; mtime: number; }
+
+function listPrompts(): PromptEntry[] {
+  ensureDirs();
+  if (!existsSync(PROMPTS_DIR)) return [];
+  const out: PromptEntry[] = [];
+  for (const f of readdirSync(PROMPTS_DIR)) {
+    if (!f.endsWith(".md")) continue;
+    const p = join(PROMPTS_DIR, f);
+    try {
+      const content = readFileSync(p, "utf8");
+      const { fm, body } = parseFrontmatter(content);
+      const mtime = statSync(p).mtimeMs;
+      out.push({ file: f, path: p, fm, body, mtime });
+    } catch {}
+  }
+  return out;
+}
+
+function scoreRelated(query: string, cwd: string | undefined, prompts: PromptEntry[], excludePath?: string) {
+  const qkw = new Set(keywords(query));
+  const results: Array<{ entry: PromptEntry; score: number }> = [];
+  for (const p of prompts) {
+    if (excludePath && p.path === excludePath) continue;
+    let score = 0;
+    if (cwd && p.fm.cwd === cwd) score += 3;
+    const okw = new Set(keywords((p.fm.title || "") + " " + p.body));
+    for (const w of qkw) if (okw.has(w)) score += 1;
+    if (score > 0) results.push({ entry: p, score });
+  }
+  results.sort((a, b) => b.score - a.score || b.entry.mtime - a.entry.mtime);
+  return results;
+}
+
+// ── Hook: SessionStart ─────────────────────────────────────────────────
+function handleSessionStart() {
+  const input = (() => { try { return JSON.parse(readStdin() || "{}"); } catch { return {}; } })();
+  const cwd = input.cwd || process.cwd();
+  const prompts = listPrompts();
+  const related = scoreRelated("", cwd, prompts).slice(0, 5);
+
+  const lines: string[] = [];
+  lines.push("📚 Obsidian Brain active. Vault: " + DATA_DIR);
+  if (related.length > 0) {
+    lines.push("");
+    lines.push("🔗 Related prior work (this cwd):");
+    for (const r of related) {
+      const t = r.entry.fm.title || r.entry.file.replace(/\.md$/, "");
+      const s = r.entry.fm.status || "?";
+      const ref = r.entry.file.replace(/\.md$/, "");
+      lines.push("  • [[" + ref + "]] — " + t + " (" + s + ")");
+    }
+    lines.push("");
+    lines.push("Use MCP tools brain_search / brain_recent / brain_read to dig in.");
+  } else {
+    lines.push("No prior prompts for this cwd yet.");
+  }
+
+  const out = {
+    hookSpecificOutput: {
+      hookEventName: "SessionStart",
+      additionalContext: lines.join("\n"),
+    },
+  };
+  process.stdout.write(JSON.stringify(out) + "\n");
+}
+
+// ── Hook: UserPromptSubmit ─────────────────────────────────────────────
+function handleUserPrompt() {
+  const input = (() => { try { return JSON.parse(readStdin() || "{}"); } catch { return {}; } })();
+  const prompt: string = input.prompt || "";
+  const sessionId: string = input.session_id || "";
+  const cwd: string = input.cwd || "";
+  if (!prompt) return;
+
+  ensureDirs();
+  const ts = iso();
+  const firstLine = prompt.split("\n")[0]!.slice(0, 80);
+  const s = slug(firstLine);
+  const hash = sha(prompt);
+  const fileName = (s || "prompt") + "-" + hash + ".md";
+  const filePath = join(PROMPTS_DIR, fileName);
+
+  // Score related by keyword + cwd
+  const related = scoreRelated(prompt, cwd, listPrompts(), filePath).slice(0, 5);
+  const relatedLines = related.map(r => "  - [[" + r.entry.file.replace(/\.md$/, "") + "]] (score " + r.score + ")").join("\n");
+  const kwList = keywords(prompt).slice(0, 12).join(", ");
+
+  if (!existsSync(filePath)) {
+    const escTitle = firstLine.replace(/"/g, '\\"');
+    const doc = [
+      "---",
+      'title: "' + escTitle + '"',
+      "created: " + ts,
+      "updated: " + ts,
+      "status: in-progress",
+      "session: " + sessionId,
+      "cwd: " + cwd,
+      "hash: " + hash,
+      "keywords: " + kwList,
+      "---",
+      "",
+      "## Prompt",
+      "",
+      prompt,
+      "",
+      "## Related",
+      "",
+      relatedLines || "  _(no related prompts found)_",
+      "",
+      "## Progress",
+      "",
+      "- [" + ts + "] Started",
+      "",
+    ].join("\n");
+    writeFileSync(filePath, doc);
+  } else {
+    let content = readFileSync(filePath, "utf8");
+    content = content.replace(/^updated: .*/m, "updated: " + ts);
+    if (!content.endsWith("\n")) content += "\n";
+    content += "- [" + ts + "] Re-submitted\n";
+    writeFileSync(filePath, content);
+  }
+
+  // Append to index.md if new
+  if (!existsSync(INDEX_FILE)) writeFileSync(INDEX_FILE, "# Obsidian Brain — prompt index\n\n");
+  const idx = readFileSync(INDEX_FILE, "utf8");
+  if (!idx.includes(hash)) {
+    appendFileSync(INDEX_FILE, "- [[" + (s || "prompt") + "-" + hash + "]] — " + firstLine + " (" + ts + ")\n");
+  }
+}
+
+// ── Hook: Stop (outcome capture) ───────────────────────────────────────
+function extractOutcomeFromTranscript(tp: string) {
+  if (!tp || !existsSync(tp)) return null;
+  let raw: string;
+  try { raw = readFileSync(tp, "utf8"); } catch { return null; }
+  const lines = raw.split("\n").filter(Boolean);
+  const toolCounts: Record<string, number> = {};
+  const filesTouched = new Set<string>();
+  let lastText = "";
+  for (const line of lines) {
+    let entry: any;
+    try { entry = JSON.parse(line); } catch { continue; }
+    if (entry.type !== "assistant") continue;
+    const content = entry.message?.content;
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      if (block && block.type === "tool_use") {
+        toolCounts[block.name] = (toolCounts[block.name] || 0) + 1;
+        const inp = block.input || {};
+        const fp = inp.file_path || inp.filePath || inp.path || inp.notebook_path;
+        if (typeof fp === "string") filesTouched.add(fp);
+      } else if (block && block.type === "text" && typeof block.text === "string" && block.text.trim().length > 0) {
+        lastText = block.text;
+      }
+    }
+  }
+  return { toolCounts, filesTouched: [...filesTouched], lastText };
+}
+
+function formatOutcomeSection(o: NonNullable<ReturnType<typeof extractOutcomeFromTranscript>>): string {
+  const tools = Object.entries(o.toolCounts).sort((a, b) => b[1] - a[1]).map(([n, c]) => n + " (" + c + ")").join(", ");
+  const files = o.filesTouched.map(f => "- \`" + f + "\`").join("\n");
+  const summary = (o.lastText || "").slice(0, 1000).trim();
+  const parts: string[] = [];
+  if (tools)   parts.push("**Tools used:** " + tools);
+  if (files)   parts.push("**Files touched:**\n" + files);
+  if (summary) parts.push("**Summary:**\n" + summary);
+  return parts.length > 0 ? parts.join("\n\n") : "_(no activity captured)_";
+}
+
+function handleStop() {
+  const input = (() => { try { return JSON.parse(readStdin() || "{}"); } catch { return {}; } })();
+  const sessionId: string = input.session_id || "";
+  const transcriptPath: string = input.transcript_path || "";
+  if (!sessionId) return;
+
+  const prompts = listPrompts();
+  let latest: PromptEntry | null = null;
+  for (const p of prompts) {
+    if (p.fm.session === sessionId && p.fm.status === "in-progress") {
+      if (!latest || p.mtime > latest.mtime) latest = p;
+    }
+  }
+  if (!latest) {
+    // Fall back to any prompt from this session
+    for (const p of prompts) {
+      if (p.fm.session === sessionId) {
+        if (!latest || p.mtime > latest.mtime) latest = p;
+      }
+    }
+  }
+  if (!latest) return;
+
+  const ts = iso();
+  let content = readFileSync(latest.path, "utf8");
+  content = content.replace(/^status: .*/m, "status: completed");
+  content = content.replace(/^updated: .*/m, "updated: " + ts);
+
+  // Append outcome section if not already present
+  const outcome = extractOutcomeFromTranscript(transcriptPath);
+  if (outcome && !/^## Outcome$/m.test(content)) {
+    if (!content.endsWith("\n")) content += "\n";
+    content += "\n## Outcome\n\n" + formatOutcomeSection(outcome) + "\n";
+  }
+
+  if (!content.endsWith("\n")) content += "\n";
+  content += "- [" + ts + "] Completed\n";
+  writeFileSync(latest.path, content);
+}
+
+// ── MCP Server ─────────────────────────────────────────────────────────
+function mcpSend(id: any, result: any) {
+  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, result }) + "\n");
+}
+function mcpError(id: any, code: number, message: string) {
+  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, error: { code, message } }) + "\n");
+}
+
+function toolSearch(query: string, limit: number): string {
+  if (!query || !query.trim()) return "Empty query.";
+  const prompts = listPrompts();
+  const scored = scoreRelated(query, undefined, prompts);
+  const top = scored.slice(0, Math.max(1, Math.min(limit || 10, 50)));
+  if (top.length === 0) return "No matches for: " + query;
+  return top.map(r => {
+    const ref = r.entry.file.replace(/\.md$/, "");
+    const t = r.entry.fm.title || ref;
+    const s = r.entry.fm.status || "?";
+    const cwd = r.entry.fm.cwd || "";
+    return "• [" + s + "] " + t + "\n  ref: " + ref + "\n  cwd: " + cwd + "\n  score: " + r.score;
+  }).join("\n\n");
+}
+
+function toolRecent(cwd: string | undefined, limit: number): string {
+  const prompts = listPrompts();
+  prompts.sort((a, b) => b.mtime - a.mtime);
+  const filtered = cwd ? prompts.filter(p => p.fm.cwd === cwd) : prompts;
+  const top = filtered.slice(0, Math.max(1, Math.min(limit || 10, 50)));
+  if (top.length === 0) return cwd ? "No prompts for cwd: " + cwd : "No prompts in brain.";
+  return top.map(p => {
+    const ref = p.file.replace(/\.md$/, "");
+    const t = p.fm.title || ref;
+    const s = p.fm.status || "?";
+    return "• [" + s + "] " + t + "\n  ref: " + ref + "\n  cwd: " + (p.fm.cwd || "");
+  }).join("\n\n");
+}
+
+function toolRead(ref: string): string {
+  if (!ref) return "ref is required.";
+  const prompts = listPrompts();
+  for (const p of prompts) {
+    const noExt = p.file.replace(/\.md$/, "");
+    if (noExt === ref || p.file === ref || p.fm.hash === ref || p.file.endsWith("-" + ref + ".md")) {
+      return readFileSync(p.path, "utf8");
+    }
+  }
+  return "Not found: " + ref;
+}
+
+async function runMcp() {
+  let buf = "";
+  process.stdin.setEncoding("utf8");
+  process.stdin.on("data", (chunk: string) => {
+    buf += chunk;
+    let nl: number;
+    while ((nl = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (line) handleMcpLine(line);
+    }
+  });
+  process.stdin.on("end", () => process.exit(0));
+}
+
+function handleMcpLine(line: string) {
+  let msg: any;
+  try { msg = JSON.parse(line); } catch { return; }
+  const id = msg.id;
+  const method = msg.method;
+
+  if (method === "initialize") {
+    return mcpSend(id, {
+      protocolVersion: "2024-11-05",
+      capabilities: { tools: {} },
+      serverInfo: { name: "obsidian-brain", version: "1.0.0" },
+    });
+  }
+  if (method === "initialized" || method === "notifications/initialized") return;
+  if (method === "tools/list") {
+    return mcpSend(id, {
+      tools: [
+        {
+          name: "brain_search",
+          description: "Search prior prompts in the Obsidian Brain vault by keyword overlap (ranked).",
+          inputSchema: {
+            type: "object",
+            properties: {
+              query: { type: "string", description: "Search terms" },
+              limit: { type: "number", description: "Max results (default 10, max 50)" },
+            },
+            required: ["query"],
+          },
+        },
+        {
+          name: "brain_recent",
+          description: "List recent prompts (by updated time), optionally filtered by cwd.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              cwd:   { type: "string", description: "Filter by working directory (optional)" },
+              limit: { type: "number", description: "Max results (default 10, max 50)" },
+            },
+          },
+        },
+        {
+          name: "brain_read",
+          description: "Read the full markdown of a specific prompt page by filename, filename-hash, or hash.",
+          inputSchema: {
+            type: "object",
+            properties: { ref: { type: "string", description: "Prompt ref" } },
+            required: ["ref"],
+          },
+        },
+      ],
+    });
+  }
+  if (method === "tools/call") {
+    const name = msg.params?.name;
+    const args = msg.params?.arguments || {};
+    let text = "";
+    try {
+      if      (name === "brain_search") text = toolSearch(args.query, args.limit);
+      else if (name === "brain_recent") text = toolRecent(args.cwd, args.limit);
+      else if (name === "brain_read")   text = toolRead(args.ref);
+      else    text = "Unknown tool: " + name;
+    } catch (e: any) {
+      text = "Error: " + (e?.message || String(e));
+    }
+    return mcpSend(id, { content: [{ type: "text", text }] });
+  }
+  if (typeof id !== "undefined") mcpError(id, -32601, "Method not found: " + method);
+}
+
+// ── Entry ──────────────────────────────────────────────────────────────
+const mode = process.argv[2] || "";
+// Hook modes self-disable when the enabled flag is absent; MCP always runs.
+if (mode !== "mcp" && !enabled()) process.exit(0);
+
+switch (mode) {
+  case "session-start": handleSessionStart(); break;
+  case "user-prompt":   handleUserPrompt();   break;
+  case "stop":          handleStop();         break;
+  case "mcp":           await runMcp();       break;
+  default:
+    console.error("Usage: obsidian-brain.ts <session-start|user-prompt|stop|mcp>");
+    process.exit(1);
+}
+`;
+
+/**
+ * Generates the brain TS script and three thin bash hook wrappers.
+ * Each wrapper is small, checks the enabled flag, and hands off to bun.
+ */
+function writeHookScripts() {
+  ensureBrainDirs();
+
+  const hookDir = getObsidianHookDir();
+  const scriptPath = getObsidianBrainScriptPath();
   const enabledFlag = getObsidianEnabledFlag();
-  const promptsDir = join(dataDir, "prompts");
-  const sessionsDir = join(dataDir, "sessions");
-  const indexFile = join(dataDir, "index.md");
 
-  // Common preamble
-  const preamble = [
-    '#!/bin/bash',
+  // Main TS script
+  writeFileSync(scriptPath, OBSIDIAN_BRAIN_SCRIPT);
+  chmodSync(scriptPath, 0o755);
+
+  // Bash wrappers — source shell rc for PATH (bun typically in ~/.bun/bin)
+  const makeWrapper = (mode: string) => [
+    "#!/bin/bash",
     `ENABLED_FLAG="${enabledFlag}"`,
-    `DATA_DIR="${dataDir}"`,
-    `PROMPTS_DIR="${promptsDir}"`,
-    `SESSIONS_DIR="${sessionsDir}"`,
-    `INDEX_FILE="${indexFile}"`,
-    '',
-    '# Self-disable when toggle is off',
     '[ ! -f "$ENABLED_FLAG" ] && exit 0',
-    '',
-    '# Read JSON input from Claude Code',
-    'INPUT="$(cat)"',
-    '',
-    'iso_now() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }',
-    'slug() { echo "$1" | tr "[:upper:]" "[:lower:]" | tr -c "a-z0-9\\n" "-" | sed "s/^-//;s/-$//" | cut -c1-80; }',
-    'hash_prompt() { echo "$1" | shasum -a 256 2>/dev/null | cut -c1-12 || md5sum | cut -c1-12; }',
-    '',
-  ].join('\n');
+    '[ -f "$HOME/.zshrc" ]  && SHELL_RC="$HOME/.zshrc"',
+    '[ -f "$HOME/.bashrc" ] && SHELL_RC="$HOME/.bashrc"',
+    '[ -n "$SHELL_RC" ] && source "$SHELL_RC" 2>/dev/null',
+    `exec bun "${scriptPath}" ${mode}`,
+    "",
+  ].join("\n");
 
-  // session-start.sh: find relevant prior prompts for the current cwd
-  const sessionStart = preamble + [
-    '# SessionStart: surface related prior prompts from the vault',
-    'CWD="$(pwd)"',
-    'CWD_SLUG=$(slug "$CWD")',
-    'echo "{\\"hookSpecificOutput\\":{\\"hookEventName\\":\\"SessionStart\\",\\"additionalContext\\":\\"$(',
-    '  echo "📚 Obsidian Brain active. Vault: $DATA_DIR"',
-    '  # Find recent prompts touching this cwd',
-    '  RECENT=$(grep -l "cwd: $CWD" "$PROMPTS_DIR"/*.md 2>/dev/null | head -5)',
-    '  if [ -n "$RECENT" ]; then',
-    '    echo "\\n🔗 Related prior prompts:"',
-    '    for f in $RECENT; do',
-    '      TITLE=$(grep "^title:" "$f" 2>/dev/null | head -1 | sed "s/^title: //")',
-    '      STATUS=$(grep "^status:" "$f" 2>/dev/null | head -1 | sed "s/^status: //")',
-    '      echo "  - [[$TITLE]] ($STATUS)"',
-    '    done',
-    '  fi',
-    ') | sed \'s/"/\\\\"/g\' | tr \'\\n\' \' \')\\"}}"',
-    'exit 0',
-  ].join('\n');
-
-  // user-prompt.sh: store the prompt, cross-link related ones
-  const userPrompt = preamble + [
-    '# UserPromptSubmit: persist prompt + link related',
-    'PROMPT=$(echo "$INPUT" | sed -n \'s/.*"prompt"[[:space:]]*:[[:space:]]*"\\(.*\\)".*/\\1/p\' | head -1)',
-    'SESSION_ID=$(echo "$INPUT" | sed -n \'s/.*"session_id"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p\' | head -1)',
-    'CWD=$(echo "$INPUT" | sed -n \'s/.*"cwd"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p\' | head -1)',
-    '[ -z "$PROMPT" ] && exit 0',
-    '',
-    'HASH=$(hash_prompt "$PROMPT")',
-    'TS=$(iso_now)',
-    'FIRST_LINE=$(echo "$PROMPT" | head -1 | cut -c1-80)',
-    'SLUG=$(slug "$FIRST_LINE")',
-    'FILE="$PROMPTS_DIR/${SLUG:-prompt}-${HASH}.md"',
-    '',
-    '# Find related prompts by shared cwd or keywords',
-    'RELATED=""',
-    'if [ -n "$CWD" ]; then',
-    '  RELATED=$(grep -l "cwd: $CWD" "$PROMPTS_DIR"/*.md 2>/dev/null | grep -v "$FILE" | head -5 | while read f; do',
-    '    basename "$f" .md | sed "s/^/  - [[/;s/$/]]/"',
-    '  done)',
-    'fi',
-    '',
-    'if [ ! -f "$FILE" ]; then',
-    '  cat > "$FILE" <<EOF',
-    '---',
-    'title: "$FIRST_LINE"',
-    'created: $TS',
-    'updated: $TS',
-    'status: in-progress',
-    'session: $SESSION_ID',
-    'cwd: $CWD',
-    'hash: $HASH',
-    '---',
-    '',
-    '## Prompt',
-    '',
-    '$PROMPT',
-    '',
-    '## Related',
-    '',
-    '$RELATED',
-    '',
-    '## Progress',
-    '',
-    '- [$TS] Started',
-    'EOF',
-    'else',
-    '  # Update existing prompt note',
-    '  sed -i.bak "s/^updated: .*/updated: $TS/" "$FILE" && rm -f "$FILE.bak"',
-    '  echo "- [$TS] Re-submitted" >> "$FILE"',
-    'fi',
-    '',
-    '# Update index',
-    'touch "$INDEX_FILE"',
-    'if ! grep -q "$HASH" "$INDEX_FILE" 2>/dev/null; then',
-    '  echo "- [[$SLUG-$HASH]] — $FIRST_LINE ($TS)" >> "$INDEX_FILE"',
-    'fi',
-    'exit 0',
-  ].join('\n');
-
-  // stop.sh: mark prompt as done, update status
-  const stop = preamble + [
-    '# Stop: mark the latest prompt for this session as done',
-    'SESSION_ID=$(echo "$INPUT" | sed -n \'s/.*"session_id"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p\' | head -1)',
-    '[ -z "$SESSION_ID" ] && exit 0',
-    '',
-    'TS=$(iso_now)',
-    '# Find the most recent in-progress prompt from this session',
-    'LATEST=$(grep -l "session: $SESSION_ID" "$PROMPTS_DIR"/*.md 2>/dev/null | xargs -I{} stat -f "%m {}" {} 2>/dev/null | sort -rn | head -1 | cut -d" " -f2-)',
-    '[ -z "$LATEST" ] && LATEST=$(grep -l "session: $SESSION_ID" "$PROMPTS_DIR"/*.md 2>/dev/null | xargs ls -t 2>/dev/null | head -1)',
-    '[ -z "$LATEST" ] && exit 0',
-    '',
-    'sed -i.bak "s/^status: .*/status: completed/" "$LATEST" && rm -f "$LATEST.bak"',
-    'sed -i.bak "s/^updated: .*/updated: $TS/" "$LATEST" && rm -f "$LATEST.bak"',
-    'echo "- [$TS] Completed" >> "$LATEST"',
-    'exit 0',
-  ].join('\n');
-
-  writeFileSync(join(hookDir, "session-start.sh"), sessionStart);
-  writeFileSync(join(hookDir, "user-prompt.sh"), userPrompt);
-  writeFileSync(join(hookDir, "stop.sh"), stop);
+  writeFileSync(join(hookDir, "session-start.sh"), makeWrapper("session-start"));
+  writeFileSync(join(hookDir, "user-prompt.sh"),   makeWrapper("user-prompt"));
+  writeFileSync(join(hookDir, "stop.sh"),          makeWrapper("stop"));
   chmodSync(join(hookDir, "session-start.sh"), 0o755);
-  chmodSync(join(hookDir, "user-prompt.sh"), 0o755);
-  chmodSync(join(hookDir, "stop.sh"), 0o755);
+  chmodSync(join(hookDir, "user-prompt.sh"),   0o755);
+  chmodSync(join(hookDir, "stop.sh"),          0o755);
 }
 
 function cmdObsidianBrainInstall(): CommandResult {
-  const skillsDir = getClaudeSkillsDir();
-  mkdirSync(skillsDir, { recursive: true });
-
   const log: string[] = [];
+
+  // 0. Ensure all directories exist up-front (avoid downstream ENOENT)
+  try {
+    ensureBrainDirs();
+    log.push("✓ Brain directories prepared");
+  } catch (e: any) {
+    return { ok: false, error: "Failed to create brain dirs: " + e.message, log: log.join("\n") };
+  }
+
+  const skillsDir = getClaudeSkillsDir();
 
   // 1. Install obsidian-skills (kepano)
   log.push("Cloning obsidian-skills…");
@@ -754,20 +1096,36 @@ function cmdObsidianBrainInstall(): CommandResult {
   }
   log.push(`✓ Obsidian skills installed to ${skillsDir}`);
 
-  // 2. Generate hook scripts
-  log.push("Writing hook scripts…");
+  // 2. Generate the brain script + hook wrappers
+  log.push("Writing brain script + hook wrappers…");
   try {
     writeHookScripts();
-    log.push(`✓ Hook scripts created in ${getObsidianHookDir()}`);
+    log.push(`✓ Brain script at ${getObsidianBrainScriptPath()}`);
+    log.push(`✓ Hook wrappers in ${getObsidianHookDir()}`);
   } catch (e: any) {
-    return { ok: false, error: "Failed to write hooks: " + e.message, log: log.join("\n") };
+    return { ok: false, error: "Failed to write brain script: " + e.message, log: log.join("\n") };
   }
 
-  // 3. Create data directories in vault
-  mkdirSync(getObsidianVaultDataDir(), { recursive: true });
-  log.push(`✓ Vault data dir ready: ${getObsidianVaultDataDir()}`);
+  // 3. Create seed index.md if missing
+  const indexFile = join(getObsidianVaultDataDir(), "index.md");
+  if (!existsSync(indexFile)) {
+    writeFileSync(indexFile, "# Obsidian Brain — prompt index\n\n");
+    log.push(`✓ Vault index created: ${indexFile}`);
+  }
 
-  // 4. Obsidian app hint
+  // 4. Register MCP server with Claude Code (so the AI can query mid-session)
+  const scriptPath = getObsidianBrainScriptPath();
+  // Remove stale registration (if any) then add fresh
+  tryRun(loginShell(`claude mcp remove obsidian-brain -s user`), 15_000);
+  const mcpAdd = tryRun(loginShell(`claude mcp add obsidian-brain -s user -- bun "${scriptPath}" mcp`), 15_000);
+  if (mcpAdd.ok) {
+    log.push("✓ MCP server 'obsidian-brain' registered (brain_search, brain_recent, brain_read)");
+  } else {
+    log.push("⚠ Failed to register MCP server — install Claude Code CLI or register manually:");
+    log.push(`   claude mcp add obsidian-brain -s user -- bun "${scriptPath}" mcp`);
+  }
+
+  // 5. Obsidian app hint
   if (!obsidianAppInstalled()) {
     log.push("ℹ Obsidian desktop app not detected — install from https://obsidian.md");
   } else {
@@ -775,7 +1133,8 @@ function cmdObsidianBrainInstall(): CommandResult {
   }
 
   log.push("");
-  log.push("Use the ON/OFF toggle to activate.");
+  log.push("Use the ON/OFF toggle to activate hooks.");
+  log.push("The MCP server is always available to Claude Code for brain queries.");
   return { ok: true, log: log.join("\n") };
 }
 
@@ -783,6 +1142,11 @@ function cmdObsidianBrainUninstall(): CommandResult {
   const log: string[] = [];
   const skillsDir = getClaudeSkillsDir();
 
+  // 1. Unregister MCP server
+  const mcpRemove = tryRun(loginShell(`claude mcp remove obsidian-brain -s user`), 15_000);
+  if (mcpRemove.ok) log.push("✓ MCP server 'obsidian-brain' unregistered");
+
+  // 2. Remove Obsidian skills
   for (const s of OBSIDIAN_SKILL_DIRS) {
     const p = join(skillsDir, s);
     if (existsSync(p)) {
@@ -791,6 +1155,7 @@ function cmdObsidianBrainUninstall(): CommandResult {
     }
   }
 
+  // 3. Remove brain dir (hooks + script + enabled flag)
   const brainDir = getObsidianBrainDir();
   if (existsSync(brainDir)) {
     rmSync(brainDir, { recursive: true, force: true });
