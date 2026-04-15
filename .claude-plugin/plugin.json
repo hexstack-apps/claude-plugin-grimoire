@@ -2,7 +2,7 @@
   "name": "grimoire",
   "display_name": "Claude Grimoire",
   "description": "Claude Code Configuration Manager — visual GUI for commands, agents, MCP servers, hooks, and CLAUDE.md memory",
-  "version": "1.0.11",
+  "version": "1.0.12",
   "license": "Apache 2.0",
   "author": {
     "name": "HexStack",
