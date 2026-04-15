@@ -2,7 +2,7 @@
   "manifestVersion": "1.0",
   "id": "app.hexstack.claude-grimoire",
   "name": "Claude Grimoire",
-  "version": "1.0.8",
+  "version": "1.0.9",
   "description": "Manage Claude Code configurations with a native GUI",
   "author": {
     "name": "HexStack",

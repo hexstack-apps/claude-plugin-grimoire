@@ -1,16 +1,104 @@
 #!/usr/bin/env bun
-import { createCli, createServer, parseArgs, run, tryRun, loginShell } from "../../_neuebun/src/cli/index";
-import { builtinCommands } from "../../_neuebun/src/cli/builtins";
-import { toKebabCase, sanitizeForShell } from "../../_neuebun/src/utils/strings";
-import type { CommandResult, CommandDict } from "../../_neuebun/src/cli/base";
 import { mkdirSync, writeFileSync, existsSync, rmSync, chmodSync } from "fs";
-import { homedir, platform } from "os";
+import { homedir, platform, arch } from "os";
 import { join, sep } from "path";
 import { execSync } from "child_process";
-import {
-  MoonbaseLicensing, FileLicenseStore, MoonbaseError,
-  type License, type ActivationRequestResponse,
-} from "@moonbase.sh/licensing";
+
+// ─── Inlined CLI utilities (no external deps) ──────────────────────────────
+
+interface CommandResult { ok: boolean; error?: string; [key: string]: any; }
+type CommandHandler = (args: string[]) => CommandResult | Promise<CommandResult>;
+type CommandDict = Record<string, CommandHandler>;
+
+function parseArgs(argv: string[]): { flags: Record<string, string>; positional: string[] } {
+  const flags: Record<string, string> = {};
+  const positional: string[] = [];
+  let i = 0;
+  while (i < argv.length) {
+    if (argv[i].startsWith("--")) {
+      const key = argv[i].slice(2);
+      if (i + 1 < argv.length && !argv[i + 1].startsWith("--")) { flags[key] = argv[i + 1]; i += 2; }
+      else { flags[key] = "true"; i += 1; }
+    } else { positional.push(argv[i]); i += 1; }
+  }
+  return { flags, positional };
+}
+
+function run(cmd: string, timeoutMs = 30_000): string {
+  return execSync(cmd, { encoding: "utf-8", timeout: timeoutMs }).trim();
+}
+
+function tryRun(cmd: string, timeoutMs = 30_000): { ok: boolean; stdout: string; stderr: string } {
+  try {
+    const stdout = execSync(cmd, { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"], timeout: timeoutMs }).trim();
+    return { ok: true, stdout, stderr: "" };
+  } catch (e: any) {
+    return { ok: false, stdout: e.stdout?.toString().trim() || "", stderr: e.stderr?.toString().trim() || e.message };
+  }
+}
+
+function loginShell(cmd: string): string {
+  const p = platform();
+  if (p === "win32") return cmd;
+  const shell = p === "darwin" ? "/bin/zsh" : "/bin/bash";
+  const escaped = cmd.replace(/'/g, "'\\''");
+  return `${shell} -lc '${escaped}'`;
+}
+
+function toKebabCase(str: string): string {
+  return str.replace(/([a-z])([A-Z])/g, "$1-$2").replace(/[\s_]+/g, "-").replace(/[^a-zA-Z0-9-]/g, "").replace(/-+/g, "-").replace(/^-|-$/g, "").toLowerCase();
+}
+
+function sanitizeForShell(str: string): string {
+  return str.replace(/[`$\\!"'\n\r]/g, "");
+}
+
+// ─── Builtin commands ───────────────────────────────────────────────────────
+
+function cmdBuiltinOsInfo(): CommandResult {
+  const p = platform();
+  return { ok: true, platform: p, arch: arch(), homedir: homedir(), pathSep: sep, isWindows: p === "win32", isMac: p === "darwin", isLinux: p === "linux" };
+}
+
+function cmdHomeDir(): CommandResult { return { ok: true, homedir: homedir() }; }
+
+function cmdEnsureDir(args: string[]): CommandResult {
+  const { positional } = parseArgs(args);
+  if (!positional[0]) return { ok: false, error: "ensure-dir requires a path argument" };
+  mkdirSync(positional[0], { recursive: true });
+  return { ok: true };
+}
+
+function cmdRemoveDir(args: string[]): CommandResult {
+  const { positional } = parseArgs(args);
+  if (!positional[0]) return { ok: false, error: "remove-dir requires a path argument" };
+  if (existsSync(positional[0])) rmSync(positional[0], { recursive: true, force: true });
+  return { ok: true };
+}
+
+function cmdOpenFile(args: string[]): CommandResult {
+  const { positional } = parseArgs(args);
+  if (!positional[0]) return { ok: false, error: "open-file requires a path argument" };
+  const p = platform();
+  try {
+    if (p === "win32") tryRun(`powershell -Command "Start-Process '${positional[0].replace(/'/g, "''")}'"`);
+    else if (p === "darwin") execSync(`open "${positional[0]}"`, { stdio: "ignore" });
+    else execSync(`xdg-open "${positional[0]}"`, { stdio: "ignore" });
+    return { ok: true };
+  } catch (e: any) { return { ok: false, error: `Failed to open file: ${e.message}` }; }
+}
+
+function cmdOpenFolder(args: string[]): CommandResult {
+  const { positional } = parseArgs(args);
+  if (!positional[0]) return { ok: false, error: "open-folder requires a path argument" };
+  const p = platform();
+  try {
+    if (p === "win32") tryRun(`powershell -Command "Invoke-Item '${positional[0].replace(/'/g, "''")}'"`);
+    else if (p === "darwin") execSync(`open "${positional[0]}"`, { stdio: "ignore" });
+    else execSync(`xdg-open "${positional[0]}"`, { stdio: "ignore" });
+    return { ok: true };
+  } catch (e: any) { return { ok: false, error: `Failed to open folder: ${e.message}` }; }
+}
 
 function getConfigDir(): string {
   if (platform() === "win32") {
@@ -115,26 +203,6 @@ function cmdRunEntity(args: string[]): CommandResult {
 
   if (cwd) command = isWindows ? `cd /d "${cwd}" && ${command}` : `cd "${cwd}" && ${command}`;
   return cmdLaunchTerminal(title ? [command, "--title", title] : [command]);
-}
-
-function cmdCheckClaude(): CommandResult {
-  const p = platform();
-  const os = p === "win32" ? "windows" : p === "darwin" ? "macos" : "linux";
-  const installSteps = os === "windows"
-    ? [
-        { label: "Install Bun", command: 'powershell -c "irm bun.sh/install.ps1|iex"' },
-        { label: "Install Claude Code", command: "bun install -g @anthropic-ai/claude-code",
-          fallback: { label: "Alternative install", command: "irm https://claude.ai/install.ps1 | iex" } },
-      ]
-    : [
-        { label: "Install Bun", command: "curl -fsSL https://bun.com/install | bash" },
-        { label: "Install Claude Code", command: "bun install -g @anthropic-ai/claude-code",
-          fallback: { label: "Alternative install", command: "curl -fsSL https://claude.ai/install.sh | bash" } },
-      ];
-  const result = tryRun(loginShell("claude --version"));
-  return result.ok && result.stdout
-    ? { ok: true, installed: true, version: result.stdout, os, installSteps }
-    : { ok: true, installed: false, os, installSteps };
 }
 
 async function cmdCheckVersion(args: string[]): Promise<CommandResult> {
@@ -299,22 +367,75 @@ const PM2_PREFIX = "cco-cron-";
 
 function cmdCronStart(args: string[]): CommandResult {
   const { flags } = parseArgs(args);
-  const id = flags["id"], pipelineName = flags["pipeline"], cronExpr = flags["cron"];
-  if (!id || !pipelineName || !cronExpr) return { ok: false, error: "cron-start requires --id, --pipeline, --cron" };
+  const id = flags["id"], cronExpr = flags["cron"];
+  // Support both new (--entity-type/--entity-name) and old (--pipeline) flags
+  const entityType = flags["entity-type"] || "pipeline";
+  const entityName = flags["entity-name"] || flags["pipeline"];
+  if (!id || !entityName || !cronExpr) return { ok: false, error: "cron-start requires --id, --entity-name (or --pipeline), --cron" };
   const cwd = flags["cwd"], skipPermissions = flags["skip-permissions"] === "true";
   const configDir = getConfigDir(), logsDir = join(configDir, "cco-cron-logs"), runnerLogDir = join(logsDir, id);
   mkdirSync(runnerLogDir, { recursive: true });
   const cliFlags = skipPermissions ? " --dangerously-skip-permissions" : "";
-  const claudeCmd = `echo "/pipeline-${toKebabCase(pipelineName)}" | claude${cliFlags} --print`;
+  // Construct the correct claude command based on entity type
+  let claudeCmd: string;
+  switch (entityType) {
+    case "command":
+      claudeCmd = `echo "/${toKebabCase(entityName)}" | claude${cliFlags} --print`;
+      break;
+    case "agent": {
+      const agentPath = join(configDir, "agents", `${toKebabCase(entityName)}.md`);
+      claudeCmd = `claude${cliFlags} --print < "${agentPath}"`;
+      break;
+    }
+    case "pipeline":
+    default:
+      claudeCmd = `echo "/pipeline-${toKebabCase(entityName)}" | claude${cliFlags} --print`;
+      break;
+  }
   const scriptPath = join(configDir, `cco-cron-${id}.sh`), latestLink = join(runnerLogDir, "latest.log");
+  const entityLabel = `${entityType.charAt(0).toUpperCase() + entityType.slice(1)}: ${entityName}`;
+  const pidFile = join(runnerLogDir, "claude.pid");
+  const skipFlag = join(runnerLogDir, "skip.flag");
+  const counterFile = join(runnerLogDir, "run_counter");
   const lines = ["#!/bin/bash", "", '[ -f "$HOME/.zshrc" ] && SHELL_RC="$HOME/.zshrc"', '[ -f "$HOME/.bashrc" ] && SHELL_RC="$HOME/.bashrc"',
     '[ -n "$SHELL_RC" ] && source "$SHELL_RC" 2>/dev/null', "", `mkdir -p "${runnerLogDir}"`, "",
+    `PID_FILE="${pidFile}"`, `SKIP_FLAG="${skipFlag}"`, `COUNTER_FILE="${counterFile}"`, "",
+    '# Kill leftover claude from previous run that did not exit',
+    'if [ -f "$PID_FILE" ]; then',
+    '  OLD_PID=$(cat "$PID_FILE" 2>/dev/null)',
+    '  if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then',
+    '    echo "[$(date -Iseconds)] Previous claude (PID $OLD_PID) still running — sending EXIT"',
+    '    kill -TERM "$OLD_PID" 2>/dev/null',
+    '    for i in $(seq 1 10); do kill -0 "$OLD_PID" 2>/dev/null || break; sleep 1; done',
+    '    kill -0 "$OLD_PID" 2>/dev/null && kill -9 "$OLD_PID" 2>/dev/null',
+    '    echo "[$(date -Iseconds)] Previous claude stopped"',
+    '  fi',
+    '  rm -f "$PID_FILE"',
+    'fi', "",
+    '# Increment run counter',
+    'RUN_NUM=$(cat "$COUNTER_FILE" 2>/dev/null || echo 0)',
+    'RUN_NUM=$((RUN_NUM + 1))',
+    'echo "$RUN_NUM" > "$COUNTER_FILE"', "",
+    '# Trap SIGTERM: kill claude child before exiting',
+    'cleanup() { [ -f "$PID_FILE" ] && kill -TERM "$(cat "$PID_FILE")" 2>/dev/null; rm -f "$PID_FILE"; exit 0; }',
+    'trap cleanup SIGTERM SIGINT', "",
     'RUN_TS="$(date +%Y-%m-%d_%H-%M-%S)"', `LOG_FILE="${runnerLogDir}/run_\${RUN_TS}.log"`, "",
-    `ln -sf "run_\${RUN_TS}.log" "${latestLink}"`, "", "{", `  echo "[$(date -Iseconds)] ======== CRON RUN START ========"`,
-    `  echo "[$(date -Iseconds)] Pipeline: ${pipelineName}"`,
+    `ln -sf "run_\${RUN_TS}.log" "${latestLink}"`, "", "{",
+    `  echo "[$(date -Iseconds)] ======== CRON RUN #\${RUN_NUM} START ========"`,
+    `  echo "[$(date -Iseconds)] ${entityLabel}"`,
     ...(cwd ? [`  echo "[$(date -Iseconds)] CWD:      ${cwd}"`, "", `  cd "${cwd}" || { echo "[$(date -Iseconds)] ERROR: Failed to cd to ${cwd}"; exit 1; }`] : []),
-    '  echo ""', "", `  ${claudeCmd} 2>&1`, "  EXIT_CODE=$?", "", '  echo ""',
-    `  echo "[$(date -Iseconds)] ======== CRON RUN END (exit: $EXIT_CODE) ========"`, '} | tee -a "$LOG_FILE"', "", "sleep infinity"];
+    '  echo ""', "",
+    '  # Check skip flag — if present, skip this run',
+    '  if [ -f "$SKIP_FLAG" ]; then',
+    `    echo "[$(date -Iseconds)] ⏭  Run #\${RUN_NUM} SKIPPED (skip.flag present)"`,
+    '    rm -f "$SKIP_FLAG"',
+    `    echo "[$(date -Iseconds)] ======== CRON RUN #\${RUN_NUM} END (skipped) ========"`,
+    '  else',
+    `    ${claudeCmd} 2>&1 &`, '    CLAUDE_PID=$!', '    echo "$CLAUDE_PID" > "$PID_FILE"', '    wait $CLAUDE_PID', "    EXIT_CODE=$?",
+    '    rm -f "$PID_FILE"', '    echo ""',
+    `    echo "[$(date -Iseconds)] ======== CRON RUN #\${RUN_NUM} END (exit: \$EXIT_CODE) ========"`,
+    '  fi',
+    '} | tee -a "$LOG_FILE"', "", "sleep infinity &", "wait"];
   writeFileSync(scriptPath, lines.join("\n") + "\n");
   chmodSync(scriptPath, 0o755);
   const name = `${PM2_PREFIX}${id}`;
@@ -325,6 +446,33 @@ function cmdCronStart(args: string[]): CommandResult {
   const r = tryRun(loginShell(`bunx pm2 start "${join(configDir, "cco-cron-ecosystem.config.cjs")}" --only "${name}"`));
   if (!r.ok || r.stderr.includes("Error")) return { ok: false, error: r.stderr || "Failed to start cron runner" };
   return { ok: true };
+}
+
+function cmdCronSkipCurrent(args: string[]): CommandResult {
+  const { flags } = parseArgs(args);
+  const id = flags["id"];
+  if (!id) return { ok: false, error: "cron-skip-current requires --id" };
+  const pidFile = join(getConfigDir(), "cco-cron-logs", id, "claude.pid");
+  if (!existsSync(pidFile)) return { ok: true, log: "No running claude process to skip" };
+  try {
+    const pid = require("node:fs").readFileSync(pidFile, "utf8").trim();
+    if (pid) {
+      tryRun(`kill -TERM ${pid}`);
+      return { ok: true, log: `Sent SIGTERM to claude (PID ${pid})` };
+    }
+  } catch {}
+  return { ok: true, log: "Skipped" };
+}
+
+function cmdCronSkipNext(args: string[]): CommandResult {
+  const { flags } = parseArgs(args);
+  const id = flags["id"];
+  if (!id) return { ok: false, error: "cron-skip-next requires --id" };
+  const runnerLogDir = join(getConfigDir(), "cco-cron-logs", id);
+  mkdirSync(runnerLogDir, { recursive: true });
+  const skipFlag = join(runnerLogDir, "skip.flag");
+  writeFileSync(skipFlag, `skip requested at ${new Date().toISOString()}\n`);
+  return { ok: true, log: "Next run will be skipped" };
 }
 
 function cmdCronStop(args: string[]): CommandResult {
@@ -380,103 +528,307 @@ function cmdKillCrons(): CommandResult {
   return { ok: true };
 }
 
-// ─── Licensing (Moonbase SDK) ────────────────────────────────────────────────
+// ─── Advanced Brain management ──────────────────────────────────────────────
 
-const MOONBASE_ENDPOINT = "https://hexstack-app.moonbase.sh";
-const MOONBASE_PRODUCT_ID = "claude-grimoire";
-const MOONBASE_PUBLIC_KEY = `-----BEGIN RSA PUBLIC KEY-----
-MIIBCgKCAQEAloaC3R0rpB1ayMiWpLoI69032NMveVrdo/2NYOshrCP9jQJhRcrN
-RfPGdLhtJT7rzHAJsbfVHpe5Z2F3tOlFEr3g/lu5qshcu24T7vv1aT+AQOoZzi7r
-Yc9gFtOoyziv1CVbn7dnc63MSycw64Bm14fVDjdu0elJnlrFKjPiCfPWcKAC8h+v
-VTZfRi9KUbbihpNMHDtFQmQjKDlTB93yktlw1K4L5sI95ddN1pP0ZnQbDy1PUQzJ
-O02pH3LpezMg+C6E5VtUm+dYH7ZP7QdRhG0rQIYm0Xqvz/yUQYYdt9z8Vhh5EbiX
-5oOO7CcBUQ7E+pDH2YxdE+aN5VeOTuxorQIDAQAB
------END RSA PUBLIC KEY-----`;
+const BRAINS_SUBDIR = join("claude-grimoire", "brains");
 
-const LICENSE_DIR = join(homedir(), ".claude");
-const LICENSE_FILE = "cco-license.mb";
+function getBrainsDir(): string {
+  return join(getConfigDir(), BRAINS_SUBDIR);
+}
 
-mkdirSync(LICENSE_DIR, { recursive: true });
+const BRAIN_DIRS = [
+  "episodic/claude-mem",
+  "semantic/opencontext",
+  "semantic/obsidian",
+  "structured/beads",
+  "identity/mempalace",
+  "shared/inbox",
+  "shared/outbox",
+  "shared/event-log",
+];
 
-const licenseStore = new FileLicenseStore({ dir: LICENSE_DIR, licenseFileName: LICENSE_FILE });
-const licensing = new MoonbaseLicensing({
-  endpoint: MOONBASE_ENDPOINT, productId: MOONBASE_PRODUCT_ID,
-  publicKey: MOONBASE_PUBLIC_KEY, licenseStore,
-});
+// ─── Obsidian Brain ─────────────────────────────────────────────────────────
 
-function serializeLicense(license: License) {
+const OBSIDIAN_SKILL_DIRS = ["obsidian-cli", "obsidian-markdown", "obsidian-bases", "json-canvas", "defuddle"];
+
+function getObsidianBrainDir(): string { return join(getConfigDir(), "claude-grimoire", "obsidian-brain"); }
+function getObsidianHookDir(): string { return join(getObsidianBrainDir(), "hooks"); }
+function getObsidianEnabledFlag(): string { return join(getObsidianBrainDir(), "enabled"); }
+function getObsidianVaultDataDir(): string { return join(getBrainsDir(), "semantic", "obsidian"); }
+function getClaudeSkillsDir(): string { return join(getConfigDir(), "skills"); }
+
+function obsidianAppInstalled(): boolean {
+  const p = platform();
+  if (p === "darwin") return existsSync("/Applications/Obsidian.app");
+  if (p === "win32") return existsSync(join(homedir(), "AppData", "Local", "Programs", "Obsidian", "Obsidian.exe"));
+  return tryRun("command -v obsidian").ok;
+}
+
+function skillsInstalled(): boolean {
+  const skillsDir = getClaudeSkillsDir();
+  return OBSIDIAN_SKILL_DIRS.some(s => existsSync(join(skillsDir, s)));
+}
+
+function hooksInstalled(): boolean {
+  const hookDir = getObsidianHookDir();
+  return existsSync(join(hookDir, "session-start.sh"))
+      && existsSync(join(hookDir, "user-prompt.sh"))
+      && existsSync(join(hookDir, "stop.sh"));
+}
+
+function cmdObsidianBrainStatus(): CommandResult {
   return {
-    id: license.id, trial: license.trial, activationMethod: license.activationMethod,
-    product: license.product,
-    issuedAt: license.issuedAt?.toISOString?.() ?? license.issuedAt,
-    issuedTo: license.issuedTo,
-    expiresAt: license.expiresAt?.toISOString?.() ?? license.expiresAt ?? null,
-    validatedAt: license.validatedAt?.toISOString?.() ?? license.validatedAt,
+    ok: true,
+    skillsInstalled: skillsInstalled(),
+    hooksInstalled: hooksInstalled(),
+    enabled: existsSync(getObsidianEnabledFlag()),
+    obsidianAppInstalled: obsidianAppInstalled(),
+    hookDir: getObsidianHookDir(),
+    vaultDataDir: getObsidianVaultDataDir(),
   };
 }
 
-async function cmdLicenseActivate(): Promise<CommandResult> {
-  try {
-    const response = await licensing.client.requestActivation();
-    const requestData = Buffer.from(JSON.stringify(response)).toString("base64");
-    return { ok: true, browser: response.browser, requestData };
-  } catch (e: any) {
-    return { ok: false, error: e instanceof MoonbaseError ? `${e.title}: ${e.detail ?? ""}` : e.message };
-  }
+/**
+ * Generates the three hook scripts. Each script no-ops when the enabled
+ * flag is absent, so toggling off is instant (no re-wire needed).
+ */
+function writeHookScripts() {
+  const hookDir = getObsidianHookDir();
+  const dataDir = getObsidianVaultDataDir();
+  mkdirSync(hookDir, { recursive: true });
+  mkdirSync(dataDir, { recursive: true });
+  mkdirSync(join(dataDir, "prompts"), { recursive: true });
+  mkdirSync(join(dataDir, "sessions"), { recursive: true });
+
+  const enabledFlag = getObsidianEnabledFlag();
+  const promptsDir = join(dataDir, "prompts");
+  const sessionsDir = join(dataDir, "sessions");
+  const indexFile = join(dataDir, "index.md");
+
+  // Common preamble
+  const preamble = [
+    '#!/bin/bash',
+    `ENABLED_FLAG="${enabledFlag}"`,
+    `DATA_DIR="${dataDir}"`,
+    `PROMPTS_DIR="${promptsDir}"`,
+    `SESSIONS_DIR="${sessionsDir}"`,
+    `INDEX_FILE="${indexFile}"`,
+    '',
+    '# Self-disable when toggle is off',
+    '[ ! -f "$ENABLED_FLAG" ] && exit 0',
+    '',
+    '# Read JSON input from Claude Code',
+    'INPUT="$(cat)"',
+    '',
+    'iso_now() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }',
+    'slug() { echo "$1" | tr "[:upper:]" "[:lower:]" | tr -c "a-z0-9\\n" "-" | sed "s/^-//;s/-$//" | cut -c1-80; }',
+    'hash_prompt() { echo "$1" | shasum -a 256 2>/dev/null | cut -c1-12 || md5sum | cut -c1-12; }',
+    '',
+  ].join('\n');
+
+  // session-start.sh: find relevant prior prompts for the current cwd
+  const sessionStart = preamble + [
+    '# SessionStart: surface related prior prompts from the vault',
+    'CWD="$(pwd)"',
+    'CWD_SLUG=$(slug "$CWD")',
+    'echo "{\\"hookSpecificOutput\\":{\\"hookEventName\\":\\"SessionStart\\",\\"additionalContext\\":\\"$(',
+    '  echo "📚 Obsidian Brain active. Vault: $DATA_DIR"',
+    '  # Find recent prompts touching this cwd',
+    '  RECENT=$(grep -l "cwd: $CWD" "$PROMPTS_DIR"/*.md 2>/dev/null | head -5)',
+    '  if [ -n "$RECENT" ]; then',
+    '    echo "\\n🔗 Related prior prompts:"',
+    '    for f in $RECENT; do',
+    '      TITLE=$(grep "^title:" "$f" 2>/dev/null | head -1 | sed "s/^title: //")',
+    '      STATUS=$(grep "^status:" "$f" 2>/dev/null | head -1 | sed "s/^status: //")',
+    '      echo "  - [[$TITLE]] ($STATUS)"',
+    '    done',
+    '  fi',
+    ') | sed \'s/"/\\\\"/g\' | tr \'\\n\' \' \')\\"}}"',
+    'exit 0',
+  ].join('\n');
+
+  // user-prompt.sh: store the prompt, cross-link related ones
+  const userPrompt = preamble + [
+    '# UserPromptSubmit: persist prompt + link related',
+    'PROMPT=$(echo "$INPUT" | sed -n \'s/.*"prompt"[[:space:]]*:[[:space:]]*"\\(.*\\)".*/\\1/p\' | head -1)',
+    'SESSION_ID=$(echo "$INPUT" | sed -n \'s/.*"session_id"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p\' | head -1)',
+    'CWD=$(echo "$INPUT" | sed -n \'s/.*"cwd"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p\' | head -1)',
+    '[ -z "$PROMPT" ] && exit 0',
+    '',
+    'HASH=$(hash_prompt "$PROMPT")',
+    'TS=$(iso_now)',
+    'FIRST_LINE=$(echo "$PROMPT" | head -1 | cut -c1-80)',
+    'SLUG=$(slug "$FIRST_LINE")',
+    'FILE="$PROMPTS_DIR/${SLUG:-prompt}-${HASH}.md"',
+    '',
+    '# Find related prompts by shared cwd or keywords',
+    'RELATED=""',
+    'if [ -n "$CWD" ]; then',
+    '  RELATED=$(grep -l "cwd: $CWD" "$PROMPTS_DIR"/*.md 2>/dev/null | grep -v "$FILE" | head -5 | while read f; do',
+    '    basename "$f" .md | sed "s/^/  - [[/;s/$/]]/"',
+    '  done)',
+    'fi',
+    '',
+    'if [ ! -f "$FILE" ]; then',
+    '  cat > "$FILE" <<EOF',
+    '---',
+    'title: "$FIRST_LINE"',
+    'created: $TS',
+    'updated: $TS',
+    'status: in-progress',
+    'session: $SESSION_ID',
+    'cwd: $CWD',
+    'hash: $HASH',
+    '---',
+    '',
+    '## Prompt',
+    '',
+    '$PROMPT',
+    '',
+    '## Related',
+    '',
+    '$RELATED',
+    '',
+    '## Progress',
+    '',
+    '- [$TS] Started',
+    'EOF',
+    'else',
+    '  # Update existing prompt note',
+    '  sed -i.bak "s/^updated: .*/updated: $TS/" "$FILE" && rm -f "$FILE.bak"',
+    '  echo "- [$TS] Re-submitted" >> "$FILE"',
+    'fi',
+    '',
+    '# Update index',
+    'touch "$INDEX_FILE"',
+    'if ! grep -q "$HASH" "$INDEX_FILE" 2>/dev/null; then',
+    '  echo "- [[$SLUG-$HASH]] — $FIRST_LINE ($TS)" >> "$INDEX_FILE"',
+    'fi',
+    'exit 0',
+  ].join('\n');
+
+  // stop.sh: mark prompt as done, update status
+  const stop = preamble + [
+    '# Stop: mark the latest prompt for this session as done',
+    'SESSION_ID=$(echo "$INPUT" | sed -n \'s/.*"session_id"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p\' | head -1)',
+    '[ -z "$SESSION_ID" ] && exit 0',
+    '',
+    'TS=$(iso_now)',
+    '# Find the most recent in-progress prompt from this session',
+    'LATEST=$(grep -l "session: $SESSION_ID" "$PROMPTS_DIR"/*.md 2>/dev/null | xargs -I{} stat -f "%m {}" {} 2>/dev/null | sort -rn | head -1 | cut -d" " -f2-)',
+    '[ -z "$LATEST" ] && LATEST=$(grep -l "session: $SESSION_ID" "$PROMPTS_DIR"/*.md 2>/dev/null | xargs ls -t 2>/dev/null | head -1)',
+    '[ -z "$LATEST" ] && exit 0',
+    '',
+    'sed -i.bak "s/^status: .*/status: completed/" "$LATEST" && rm -f "$LATEST.bak"',
+    'sed -i.bak "s/^updated: .*/updated: $TS/" "$LATEST" && rm -f "$LATEST.bak"',
+    'echo "- [$TS] Completed" >> "$LATEST"',
+    'exit 0',
+  ].join('\n');
+
+  writeFileSync(join(hookDir, "session-start.sh"), sessionStart);
+  writeFileSync(join(hookDir, "user-prompt.sh"), userPrompt);
+  writeFileSync(join(hookDir, "stop.sh"), stop);
+  chmodSync(join(hookDir, "session-start.sh"), 0o755);
+  chmodSync(join(hookDir, "user-prompt.sh"), 0o755);
+  chmodSync(join(hookDir, "stop.sh"), 0o755);
 }
 
-async function cmdLicensePoll(args: string[]): Promise<CommandResult> {
-  const { positional } = parseArgs(args);
-  if (!positional[0]) return { ok: false, error: "poll requires requestData argument" };
+function cmdObsidianBrainInstall(): CommandResult {
+  const skillsDir = getClaudeSkillsDir();
+  mkdirSync(skillsDir, { recursive: true });
+
+  const log: string[] = [];
+
+  // 1. Install obsidian-skills (kepano)
+  log.push("Cloning obsidian-skills…");
+  const tmp = "/tmp/obsidian-skills-tmp";
+  tryRun(`rm -rf "${tmp}"`);
+  const cloneResult = tryRun(`git clone --depth 1 https://github.com/kepano/obsidian-skills.git "${tmp}"`, 60_000);
+  if (!cloneResult.ok) {
+    return { ok: false, error: "Failed to clone obsidian-skills: " + cloneResult.stderr, log: log.join("\n") };
+  }
+  const copyResult = tryRun(`cp -r "${tmp}/skills/"* "${skillsDir}/"`);
+  tryRun(`rm -rf "${tmp}"`);
+  if (!copyResult.ok) {
+    return { ok: false, error: "Failed to copy skills: " + copyResult.stderr, log: log.join("\n") };
+  }
+  log.push(`✓ Obsidian skills installed to ${skillsDir}`);
+
+  // 2. Generate hook scripts
+  log.push("Writing hook scripts…");
   try {
-    const request: ActivationRequestResponse = JSON.parse(Buffer.from(positional[0], "base64").toString("utf8"));
-    const license = await licensing.client.getRequestedActivation(request);
-    if (license) {
-      await licenseStore.storeLocalLicense(license);
-      return { ok: true, activated: true, license: serializeLicense(license) };
+    writeHookScripts();
+    log.push(`✓ Hook scripts created in ${getObsidianHookDir()}`);
+  } catch (e: any) {
+    return { ok: false, error: "Failed to write hooks: " + e.message, log: log.join("\n") };
+  }
+
+  // 3. Create data directories in vault
+  mkdirSync(getObsidianVaultDataDir(), { recursive: true });
+  log.push(`✓ Vault data dir ready: ${getObsidianVaultDataDir()}`);
+
+  // 4. Obsidian app hint
+  if (!obsidianAppInstalled()) {
+    log.push("ℹ Obsidian desktop app not detected — install from https://obsidian.md");
+  } else {
+    log.push("✓ Obsidian app detected");
+  }
+
+  log.push("");
+  log.push("Use the ON/OFF toggle to activate.");
+  return { ok: true, log: log.join("\n") };
+}
+
+function cmdObsidianBrainUninstall(): CommandResult {
+  const log: string[] = [];
+  const skillsDir = getClaudeSkillsDir();
+
+  for (const s of OBSIDIAN_SKILL_DIRS) {
+    const p = join(skillsDir, s);
+    if (existsSync(p)) {
+      rmSync(p, { recursive: true, force: true });
+      log.push(`✓ Removed skill: ${s}`);
     }
-    return { ok: true, activated: false };
-  } catch (e: any) {
-    return { ok: false, error: e instanceof MoonbaseError ? `${e.title}: ${e.detail ?? ""}` : e.message };
   }
+
+  const brainDir = getObsidianBrainDir();
+  if (existsSync(brainDir)) {
+    rmSync(brainDir, { recursive: true, force: true });
+    log.push(`✓ Removed ${brainDir}`);
+  }
+
+  // Note: vault data is preserved on purpose — user may want to keep the notes
+  log.push(`ℹ Vault data preserved at ${getObsidianVaultDataDir()} (delete manually if desired)`);
+
+  return { ok: true, log: log.join("\n") };
 }
 
-async function cmdLicenseValidate(): Promise<CommandResult> {
-  try {
-    const license = await licenseStore.loadLocalLicense();
-    if (!license) return { ok: true, valid: false, reason: "no_license" };
-    const updated = await licensing.client.validateLicense(license);
-    await licenseStore.storeLocalLicense(updated);
-    return { ok: true, valid: true, license: serializeLicense(updated) };
-  } catch (e: any) {
-    if (e instanceof MoonbaseError) {
-      return { ok: true, valid: false, reason: e.type ?? "validation_failed", detail: `${e.title}: ${e.detail ?? ""}` };
-    }
-    return { ok: false, error: e.message };
+function cmdObsidianBrainSetEnabled(args: string[]): CommandResult {
+  const { flags } = parseArgs(args);
+  const enabled = flags["enabled"] === "true";
+  const flag = getObsidianEnabledFlag();
+  mkdirSync(getObsidianBrainDir(), { recursive: true });
+  if (enabled) {
+    writeFileSync(flag, new Date().toISOString() + "\n");
+  } else {
+    if (existsSync(flag)) rmSync(flag, { force: true });
   }
-}
-
-async function cmdLicenseStatus(): Promise<CommandResult> {
-  try {
-    const license = await licenseStore.loadLocalLicense();
-    if (!license) return { ok: true, active: false };
-    return { ok: true, active: true, license: serializeLicense(license) };
-  } catch (e: any) {
-    return { ok: false, error: e instanceof MoonbaseError ? `${e.title}: ${e.detail ?? ""}` : e.message };
-  }
+  return { ok: true, hookDir: getObsidianHookDir(), enabled };
 }
 
 // ─── Command dictionary ─────────────────────────────────────────────────────
 
 const COMMANDS: CommandDict = {
-  // NeueBun builtins (os-info, home-dir, ensure-dir, remove-dir, open-file, open-folder)
-  ...builtinCommands,
-  // Override os-info with grimoire-specific version (adds configDir)
+  // Builtins
   "os-info": cmdOsInfo,
-  // Grimoire-specific commands
+  "home-dir": cmdHomeDir,
+  "ensure-dir": cmdEnsureDir,
+  "remove-dir": cmdRemoveDir,
+  "open-file": cmdOpenFile,
+  "open-folder": cmdOpenFolder,
+  // Grimoire commands
   "launch-terminal": cmdLaunchTerminal,
   "run-entity": cmdRunEntity,
-  "check-claude": cmdCheckClaude,
   "check-version": cmdCheckVersion,
   "git-init": cmdGitInit,
   "git-commit": cmdGitCommit,
@@ -489,24 +841,27 @@ const COMMANDS: CommandDict = {
   "docker-discover": cmdDockerDiscover,
   "cron-start": cmdCronStart,
   "cron-stop": cmdCronStop,
+  "cron-skip-current": cmdCronSkipCurrent,
+  "cron-skip-next": cmdCronSkipNext,
   "cron-status": cmdCronStatus,
   "cron-log": cmdCronLog,
   "cron-clean": cmdCronClean,
   "kill-terminals": cmdKillTerminals,
   "kill-crons": cmdKillCrons,
-  "license-activate": cmdLicenseActivate,
-  "license-poll": cmdLicensePoll,
-  "license-validate": cmdLicenseValidate,
-  "license-status": cmdLicenseStatus,
+  "obsidian-brain-status": cmdObsidianBrainStatus,
+  "obsidian-brain-install": cmdObsidianBrainInstall,
+  "obsidian-brain-uninstall": cmdObsidianBrainUninstall,
+  "obsidian-brain-set-enabled": cmdObsidianBrainSetEnabled,
 };
 
-// ─── Entry point: CLI or server mode ────────────────────────────────────────
+// ─── Entry point ────────────────────────────────────────────────────────────
 
-const firstArg = process.argv[2];
-
-if (firstArg === "--serve") {
-  const port = parseInt(process.argv[3] || "0", 10);
-  createServer(COMMANDS, { port });
-} else {
-  createCli(COMMANDS).run();
+const [cmd, ...restArgs] = process.argv.slice(2);
+if (!cmd || !COMMANDS[cmd]) {
+  console.log(JSON.stringify({ ok: false, error: `Unknown command: ${cmd || "(none)"}` }));
+  process.exit(1);
 }
+const result = COMMANDS[cmd](restArgs);
+const finish = (r: CommandResult) => { console.log(JSON.stringify(r)); process.exit(r.ok ? 0 : 1); };
+if (result instanceof Promise) result.then(finish).catch((e: Error) => finish({ ok: false, error: e.message }));
+else finish(result);
