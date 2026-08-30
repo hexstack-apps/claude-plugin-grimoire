@@ -24,6 +24,46 @@ function parseArgs(argv: string[]): { flags: Record<string, string>; positional:
   return { flags, positional };
 }
 
+/**
+ * Fail-safe helpers for the CLI.
+ *
+ * Mirrors src/utils/failsafe.ts, but CANNOT reuse it: this file is compiled to
+ * a standalone binary with no app imports, and — more importantly — its entire
+ * contract is "one JSON object on stdout". Routing a suppressed-error message
+ * through console.log would splice log lines into that JSON and break every
+ * caller in grimoireCliService.ts. So diagnostics go to STDERR, which the GUI
+ * captures separately and a human sees when running the binary by hand.
+ *
+ * `op` is a short stable label ("git.add", "docker.parseContainer") — it is
+ * what you grep for, so never build it from variable data.
+ */
+function recordFailure(op: string, err: unknown, context?: unknown): void {
+  const message = err instanceof Error ? err.message : String(err);
+  const suffix = context === undefined ? "" : ` ${JSON.stringify(context)}`;
+  console.error(`[grimoire-cli][failsafe] ${op} failed: ${message}${suffix}`);
+}
+
+/** Run for side effects only; returns false if it threw. Never rethrows. */
+function attempt(op: string, fn: () => void, context?: unknown): boolean {
+  try {
+    fn();
+    return true;
+  } catch (err) {
+    recordFailure(op, err, context);
+    return false;
+  }
+}
+
+/** Run for a value; returns `fallback` if it threw. Never rethrows. */
+function quiet<T>(op: string, fn: () => T, fallback: T, context?: unknown): T {
+  try {
+    return fn();
+  } catch (err) {
+    recordFailure(op, err, context);
+    return fallback;
+  }
+}
+
 function run(cmd: string, timeoutMs = 30_000): string {
   return execSync(cmd, { encoding: "utf-8", timeout: timeoutMs }).trim();
 }
@@ -236,7 +276,9 @@ function gitCmd(dir: string, args: string): string { return run(`git -C "${dir}"
 function gitCmdSafe(dir: string, args: string) { return tryRun(`git -C "${dir}" ${args}`); }
 function stageEntityFiles(dir: string): void {
   gitCmd(dir, "read-tree --empty"); gitCmd(dir, "add --force .gitignore");
-  for (const d of ["commands", "agents", "cco-prompts"]) { try { gitCmd(dir, `add ${d}/`); } catch {} }
+  // A missing entity directory is normal (user may have no agents yet), so a
+  // failure here must not abort staging the others.
+  for (const d of ["commands", "agents", "cco-prompts"]) attempt("git.addEntityDir", () => gitCmd(dir, `add ${d}/`), { dir: d });
 }
 function formatTimestamp(): string { return new Date().toISOString().replace(/[:.]/g, "-"); }
 
@@ -250,7 +292,7 @@ function cmdGitInit(): CommandResult {
   if (status.ok && status.stdout) {
     gitCmd(dir, `commit --author="${GIT_AUTHOR}" -m "CCO backup enabled -- ${GIT_COMMIT_PREFIX}-${formatTimestamp()}"`);
   } else {
-    try { gitCmd(dir, `commit --allow-empty --author="${GIT_AUTHOR}" -m "Initial backup -- ${GIT_COMMIT_PREFIX}-init"`); } catch {}
+    attempt("git.commitInitialEmpty", () => gitCmd(dir, `commit --allow-empty --author="${GIT_AUTHOR}" -m "Initial backup -- ${GIT_COMMIT_PREFIX}-init"`));
   }
   return { ok: true };
 }
@@ -339,7 +381,11 @@ function cmdDockerDiscover(): CommandResult {
         const sn = (c.name || img.split("/").pop()?.split(":")[0] || c.id).replace(/[^a-zA-Z0-9_-]/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
         result.discovered.push({ name: sn, image: c.image, containerId: c.id, ports: c.ports || "", status: c.status || "", source: "container",
           mcpServer: { name: sn, type: "stdio", command: "docker", args: ["run", "-i", "--rm", c.image], scope: "global" } });
-      } catch {}
+      } catch (err) {
+        // One malformed line must not lose the other containers. Kept as an
+        // inline catch rather than a helper because the body uses `continue`.
+        recordFailure("docker.parseContainer", err, { line });
+      }
     }
   }
 
@@ -355,7 +401,9 @@ function cmdDockerDiscover(): CommandResult {
           result.discovered.push({ name: n, image: "docker mcp gateway", containerId: "", ports: "", status: "toolkit-managed", source: "toolkit-profile",
             mcpServer: { name: n, type: "stdio", command: "docker", args: ["mcp", "gateway", "run", "--profile", pn], scope: "global" } });
         }
-      } catch {}
+      } catch (err) {
+        recordFailure("docker.parseToolkitProfiles", err);
+      }
     }
   }
   return result;
@@ -460,7 +508,11 @@ function cmdCronSkipCurrent(args: string[]): CommandResult {
       tryRun(`kill -TERM ${pid}`);
       return { ok: true, log: `Sent SIGTERM to claude (PID ${pid})` };
     }
-  } catch {}
+  } catch (err) {
+    // Unreadable/stale pid file is not fatal — skipping is still a success
+    // from the caller's point of view, but the reason must be traceable.
+    recordFailure("cron.readClaudePid", err, { pidFile });
+  }
   return { ok: true, log: "Skipped" };
 }
 
@@ -505,7 +557,9 @@ function cmdCronLog(args: string[]): CommandResult {
 
 function cmdCronClean(): CommandResult {
   const r = tryRun(loginShell("bunx pm2 jlist"));
-  if (r.ok) { try { for (const p of (JSON.parse(r.stdout) as Array<{ name: string }>).filter(p => p.name.startsWith(PM2_PREFIX))) tryRun(loginShell(`bunx pm2 delete "${p.name}"`)); } catch {} }
+  if (r.ok) attempt("cron.cleanPm2Processes", () => {
+    for (const p of (JSON.parse(r.stdout) as Array<{ name: string }>).filter(p => p.name.startsWith(PM2_PREFIX))) tryRun(loginShell(`bunx pm2 delete "${p.name}"`));
+  });
   return { ok: true };
 }
 
@@ -524,7 +578,9 @@ function cmdKillTerminals(args: string[]): CommandResult {
 
 function cmdKillCrons(): CommandResult {
   const r = tryRun(loginShell("bunx pm2 jlist 2>/dev/null"));
-  if (r.ok) { try { for (const p of (JSON.parse(r.stdout) as Array<{ name: string }>).filter(p => p.name.startsWith(PM2_PREFIX))) tryRun(loginShell(`bunx pm2 delete "${p.name}" 2>/dev/null`)); } catch {} }
+  if (r.ok) attempt("cron.killPm2Processes", () => {
+    for (const p of (JSON.parse(r.stdout) as Array<{ name: string }>).filter(p => p.name.startsWith(PM2_PREFIX))) tryRun(loginShell(`bunx pm2 delete "${p.name}" 2>/dev/null`));
+  });
   return { ok: true };
 }
 
@@ -686,7 +742,10 @@ function listPrompts(): PromptEntry[] {
       const { fm, body } = parseFrontmatter(content);
       const mtime = statSync(p).mtimeMs;
       out.push({ file: f, path: p, fm, body, mtime });
-    } catch {}
+    } catch (err) {
+      // One unreadable prompt must not empty the whole list.
+      recordFailure("prompts.readEntry", err, { file: f });
+    }
   }
   return out;
 }

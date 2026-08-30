@@ -1,7 +1,7 @@
 {
   "name": "grimoire",
   "display_name": "Claude Grimoire",
-  "description": "Claude Code Configuration Manager — visual GUI for commands, agents, MCP servers, hooks, and CLAUDE.md memory",
+  "description": "Claude Code Configuration Manager \u2014 visual GUI for commands, agents, MCP servers, hooks, and CLAUDE.md memory",
   "version": "1.0.19",
   "license": "Apache 2.0",
   "author": {
@@ -12,12 +12,12 @@
   "platforms": [
     "darwin",
     "linux",
-    "win64"
+    "win32"
   ],
   "arch": [
     "x64",
     "arm64"
   ],
-  "repository": "https://github.com/rchuvilev/claude-plugin-grimoire",
+  "repository": "https://github.com/hexstack-apps/claude-plugin-grimoire",
   "commands": "./commands/"
 }
