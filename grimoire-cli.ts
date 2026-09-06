@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { mkdirSync, writeFileSync, existsSync, rmSync, chmodSync } from "fs";
+import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, chmodSync } from "fs";
 import { homedir, platform, arch } from "os";
 import { join, sep } from "path";
 import { execSync } from "child_process";
@@ -270,15 +270,122 @@ async function cmdCheckVersion(args: string[]): Promise<CommandResult> {
 const GIT_AUTHOR = 'CCO Backup <cco@local>';
 const GIT_COMMIT_PREFIX = "cco-backup";
 const GIT_MAX_COMMITS = 200;
-const GITIGNORE_CONTENT = `# Ignore everything\n*\n\n# Allow specific directories and their contents\n!commands/\n!commands/**\n!agents/\n!agents/**\n!cco-prompts/\n!cco-prompts/**\n\n# Allow this file\n!.gitignore\n`;
+/**
+ * Every entity directory the backup protects.
+ *
+ * 🔴🔴 This list used to be three hardcoded literals repeated in THREE places
+ * (the .gitignore allowlist, stageEntityFiles, and cmdGitRestore), covering
+ * only commands / agents / cco-prompts. Measured end-to-end with a realistic
+ * ~/.claude, five of the eight entity types were NOT backed up:
+ *
+ *   commands YES · agents YES · prompts YES
+ *   skills NO · rules NO · workflows NO · output-styles NO · pipelines NO
+ *
+ * They were not merely missed — the .gitignore is deny-all (`*`) with an
+ * explicit allowlist, so the other five were ACTIVELY excluded. Meanwhile the
+ * Backup tab promises "control your library edits history", unqualified. A user
+ * who enabled backup reasonably believed their Skills were safe; they were not,
+ * and Skills and Pipelines are the most laborious things in the app to author.
+ *
+ * Kept in ONE place so adding an entity type cannot silently skip the backup —
+ * which is exactly how this drifted: rules and workflows were added in 33b50ed
+ * and never reached these literals.
+ *
+ * ⚠️ This must stay in sync with CLAUDE_SUBDIRS in src/app/consts.tsx. It is
+ * duplicated rather than imported because grimoire-cli.ts is a STANDALONE
+ * binary — it deliberately imports nothing from src/ (its contract is one JSON
+ * object on stdout, and pulling in app modules would break that). The sync is
+ * asserted by a test instead of trusted.
+ */
+const BACKUP_DIRS = [
+  'commands',
+  'agents',
+  'cco-prompts',
+  'cco-pipelines',
+  'skills',
+  'output-styles',
+  'rules',
+  'workflows',
+] as const;
+
+/**
+ * Deny-all, then re-allow each backup directory. Generated from BACKUP_DIRS so
+ * the allowlist cannot disagree with what gets staged.
+ */
+const GITIGNORE_CONTENT = [
+  '# Ignore everything',
+  '*',
+  '',
+  '# Allow specific directories and their contents',
+  ...BACKUP_DIRS.flatMap(d => [`!${d}/`, `!${d}/**`]),
+  '',
+  '# Allow this file',
+  '!.gitignore',
+  '',
+].join('\n');
 
 function gitCmd(dir: string, args: string): string { return run(`git -C "${dir}" ${args}`); }
 function gitCmdSafe(dir: string, args: string) { return tryRun(`git -C "${dir}" ${args}`); }
+/**
+ * Write the .gitignore whenever it differs from what this version generates.
+ *
+ * 🔴🔴 This used to be `if (!existsSync(...)) write(...)` — written once, never
+ * refreshed. So widening BACKUP_DIRS did NOT reach anyone who had already
+ * enabled backup: their on-disk allowlist still named three directories, and
+ * the deny-all `*` kept excluding skills, rules, workflows, output-styles and
+ * pipelines forever. Measured on a simulated old install, skills stayed
+ * untracked after a commit from the fixed version.
+ *
+ * That is the population most at risk — they have been running with backup ON,
+ * believing it covers their library. Rewriting on mismatch makes the fix
+ * self-healing on the next commit rather than only helping fresh installs.
+ *
+ * Compared by content, not blindly overwritten, so a user who deliberately
+ * edited the file is not fought with on every single commit — only corrected
+ * when it no longer matches the directories actually being staged.
+ */
+function ensureGitignoreCurrent(dir: string): void {
+  const path = join(dir, ".gitignore");
+  // attempt() returns a boolean, not the value, so read via tryRead: an
+  // unreadable .gitignore must mean "rewrite it", never crash the commit.
+  let current: string | null = null;
+  if (existsSync(path)) {
+    try {
+      current = readFileSync(path, "utf8");
+    } catch (err) {
+      recordFailure("git.readGitignore", err, { path });
+    }
+  }
+  if (current !== GITIGNORE_CONTENT) {
+    writeFileSync(path, GITIGNORE_CONTENT);
+  }
+}
+
 function stageEntityFiles(dir: string): void {
-  gitCmd(dir, "read-tree --empty"); gitCmd(dir, "add --force .gitignore");
-  // A missing entity directory is normal (user may have no agents yet), so a
-  // failure here must not abort staging the others.
-  for (const d of ["commands", "agents", "cco-prompts"]) attempt("git.addEntityDir", () => gitCmd(dir, `add ${d}/`), { dir: d });
+  gitCmd(dir, "read-tree --empty");
+  gitCmd(dir, "add --force .gitignore");
+
+  /**
+   * `add .` rather than a loop over BACKUP_DIRS.
+   *
+   * The .gitignore is deny-all (`*`) plus an allowlist generated from
+   * BACKUP_DIRS, so `add .` stages exactly the allowed directories and nothing
+   * else. Measured identical to the per-directory loop — same files, and zero
+   * leakage of `.credentials.json`, `projects/*.jsonl` session transcripts,
+   * `todos/`, `statsig/` or stray caches.
+   *
+   * It is better than the loop because the allowlist becomes the SINGLE
+   * authority: a newly added entity type is covered by updating one list, not
+   * two that can disagree. It also drops the per-directory `attempt()` calls,
+   * which existed only because `git add missing-dir/` fails for a user who has
+   * no agents yet — `add .` simply doesn't have that failure mode.
+   *
+   * 🔴 NEVER `add --force .` here. Measured: it bypasses the allowlist and
+   * stages `.credentials.json` (an auth token), session transcripts and Claude
+   * Code's internal state — 5 leaked files in a repo that `git-push` can send
+   * to a remote.
+   */
+  gitCmd(dir, "add .");
 }
 function formatTimestamp(): string { return new Date().toISOString().replace(/[:.]/g, "-"); }
 
@@ -286,7 +393,7 @@ function cmdGitInit(): CommandResult {
   const dir = getConfigDir();
   mkdirSync(dir, { recursive: true });
   if (!existsSync(join(dir, ".git"))) run(`git init -b main "${dir}"`);
-  writeFileSync(join(dir, ".gitignore"), GITIGNORE_CONTENT);
+  ensureGitignoreCurrent(dir);
   stageEntityFiles(dir);
   const status = gitCmdSafe(dir, "status --porcelain");
   if (status.ok && status.stdout) {
@@ -302,7 +409,7 @@ function cmdGitCommit(args: string[]): CommandResult {
   const entityType = flags["entity-type"], entityName = flags["entity-name"], action = flags["action"];
   if (!entityType || !entityName || !action) return { ok: false, error: "git-commit requires --entity-type, --entity-name, --action" };
   const dir = getConfigDir();
-  if (!existsSync(join(dir, ".gitignore"))) writeFileSync(join(dir, ".gitignore"), GITIGNORE_CONTENT);
+  ensureGitignoreCurrent(dir);
   stageEntityFiles(dir);
   const status = gitCmdSafe(dir, "status --porcelain");
   if (!status.ok || !status.stdout) return { ok: true, committed: false, reason: "no_changes" };
@@ -328,8 +435,27 @@ function cmdGitRestore(args: string[]): CommandResult {
   const hash = positional[0], originalMessage = positional[1] || "";
   if (!hash || !/^[0-9a-f]{40}$/.test(hash)) return { ok: false, error: "git-restore requires a valid 40-char commit hash" };
   const dir = getConfigDir();
-  for (const d of ["commands", "agents", "cco-prompts"]) { const p = join(dir, d); if (existsSync(p)) rmSync(p, { recursive: true, force: true }); }
+  /**
+   * Clear every backed-up directory before checking the commit out, so a file
+   * the user ADDED since that commit does not survive the restore. This list
+   * used to be the same three literals as the staging list, which meant a
+   * restore left skills/rules/workflows/output-styles/pipelines untouched —
+   * silently mixing the restored state with the current one.
+   */
+  for (const d of BACKUP_DIRS) { const p = join(dir, d); if (existsSync(p)) rmSync(p, { recursive: true, force: true }); }
   gitCmd(dir, `checkout ${hash} -- .`);
+  /**
+   * 🔴 Re-assert the allowlist AFTER the checkout, not before.
+   *
+   * The checkout restores the .gitignore as it was in that commit. Measured: a
+   * user who upgraded (allowlist repaired to 8 dirs, skills picked up) and then
+   * rolled back to a commit made by the old version got the 3-dir allowlist
+   * back, and skills/rules/workflows silently dropped out of backup again.
+   *
+   * Restoring CONTENT to an earlier point is the feature; restoring the backup
+   * CONFIGURATION to an earlier point is not.
+   */
+  ensureGitignoreCurrent(dir);
   stageEntityFiles(dir);
   gitCmd(dir, `commit --allow-empty --author="${GIT_AUTHOR}" -m "Restored: ${sanitizeForShell(originalMessage)} -- ${GIT_COMMIT_PREFIX}-${formatTimestamp()}"`);
   return { ok: true };
@@ -1285,7 +1411,27 @@ if (!cmd || !COMMANDS[cmd]) {
   console.log(JSON.stringify({ ok: false, error: `Unknown command: ${cmd || "(none)"}` }));
   process.exit(1);
 }
-const result = COMMANDS[cmd](restArgs);
 const finish = (r: CommandResult) => { console.log(JSON.stringify(r)); process.exit(r.ok ? 0 : 1); };
-if (result instanceof Promise) result.then(finish).catch((e: Error) => finish({ ok: false, error: e.message }));
-else finish(result);
+
+/**
+ * 🔴 A SYNCHRONOUS throw used to escape entirely.
+ *
+ * Only the promise path had a `.catch`, so any sync command that threw — e.g.
+ * cmdGitInit when a `git` invocation fails — exited with status 1 and produced
+ * ZERO bytes on stdout. Every caller then failed with "JSON Parse error:
+ * Unexpected EOF" while the real cause sat in stderr, unread.
+ *
+ * This is the same defect class fixed on the client side in c4fe72d: the
+ * contract is one JSON object on stdout, so the contract has to hold on the
+ * failure path too — that is precisely when the caller needs it most.
+ */
+try {
+  const result = COMMANDS[cmd](restArgs);
+  if (result instanceof Promise) {
+    result.then(finish).catch((e: Error) => finish({ ok: false, error: e?.message || String(e) }));
+  } else {
+    finish(result);
+  }
+} catch (e: any) {
+  finish({ ok: false, error: e?.message || String(e) });
+}
